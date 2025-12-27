@@ -1,16 +1,32 @@
 // 配置常量
 const UPSTREAM_ORIGIN = "https://theoldllm.vercel.app";
-const DEFAULT_MODEL = "ent-claude-opus-4.5-20251101";
+// 默认模型设置为列表中比较强的一个，你可以根据需要修改
+const DEFAULT_MODEL = "gpt-4o"; 
 
-// 硬编码的默认 Token (来自你的 curl)
+// 硬编码的默认 Token (来自你的抓包)
 const FALLBACK_TOKEN = "Bearer ";
 
+// 根据 /entp/llm/provider 接口提取的所有模型
 const ALLOWED_MODELS = [
-  "ent-claude-opus-4.5-20251101",
-  "ent-claude-opus-4.1"
+  // --- OpenAI ---
+  "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-5-mini", "gpt-5-nano",
+  "o4-mini", "o3-mini", "o1-mini", "o3", "o1",
+  "gpt-4", "gpt-4.1", "gpt-4o", "gpt-4o-mini", "o1-preview",
+  "gpt-4-turbo", "gpt-4-turbo-preview", "gpt-4-1106-preview", "gpt-4-vision-preview",
+  "gpt-4-0613", "gpt-4o-2024-08-06", "gpt-4-0314", "gpt-4-32k-0314",
+  "gpt-3.5-turbo", "gpt-3.5-turbo-0125", "gpt-3.5-turbo-1106", "gpt-3.5-turbo-16k",
+  "gpt-3.5-turbo-0613", "gpt-3.5-turbo-16k-0613", "gpt-3.5-turbo-0301",
+  
+  // --- Anthropic ---
+  "claude-3-7-sonnet-latest", "claude-haiku-4-5-20251001", "claude-3-5-haiku-20241022",
+  "claude-3-5-sonnet-20241022", "claude-sonnet-4-20250514", "claude-opus-4-5-20251101",
+  "claude-opus-4-20250514", "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest",
+  "claude-3-7-sonnet-20250219", "claude-4-opus-20250514", "claude-3-5-sonnet-20240620",
+  "claude-opus-4-5", "claude-haiku-4-5", "claude-sonnet-4-5-20250929",
+  "claude-3-opus-20240229", "claude-opus-4-1-20250805", "claude-sonnet-4-5",
+  "claude-3-haiku-20240307", "claude-4-sonnet-20250514", "claude-3-opus-latest", "claude-opus-4-1"
 ];
 
-// 伪装 Headers (严格复制自你的成功抓包)
 const COMMON_HEADERS = {
   "authority": "theoldllm.vercel.app",
   "accept": "*/*",
@@ -39,7 +55,7 @@ Deno.serve(async (req) => {
     });
   }
 
-  // 1. /v1/models 接口
+  // 1. /v1/models 接口 (返回抓取到的所有模型)
   if (url.pathname === "/v1/models") {
     return new Response(
       JSON.stringify({
@@ -65,6 +81,7 @@ Deno.serve(async (req) => {
     try {
       const body = await req.json();
       const isStream = body.stream || false;
+      // 如果请求的模型不在列表中，默认使用 DEFAULT_MODEL，或者你可以允许透传
       const model = body.model || DEFAULT_MODEL;
 
       // 鉴权
@@ -74,7 +91,10 @@ Deno.serve(async (req) => {
       }
 
       // --- 第一步：创建会话 (Create Chat Session) ---
-      // 根据 Logs，必须先请求这个接口拿到 chat_session_id
+      // 这里的 description 按照抓包格式，动态填入请求的 model
+      // 假设上游通过 description 或 persona_id 来区分模型
+      const sessionDescription = `Streaming chat session using ${model}`;
+      
       const createSessionResp = await fetch(`${UPSTREAM_ORIGIN}/entp/chat/create-chat-session`, {
         method: "POST",
         headers: {
@@ -82,13 +102,14 @@ Deno.serve(async (req) => {
           "authorization": authHeader,
         },
         body: JSON.stringify({
-          persona_id: 154, // 根据抓包数据硬编码
-          description: "Streaming chat session using gpt-5.2" // 描述可以随意，保留抓包原样
+          persona_id: 154, // 抓包中固定的 Persona ID
+          description: sessionDescription
         })
       });
 
       if (!createSessionResp.ok) {
-        throw new Error(`Failed to create session: ${createSessionResp.statusText}`);
+        const errText = await createSessionResp.text();
+        throw new Error(`Failed to create session (${createSessionResp.status}): ${errText}`);
       }
 
       const sessionData = await createSessionResp.json();
@@ -109,7 +130,7 @@ Deno.serve(async (req) => {
         },
         body: JSON.stringify({
           chat_session_id: chatSessionId,
-          parent_message_id: null, // 抓包显示为 null
+          parent_message_id: null, 
           message: prompt,
           file_descriptors: [],
           search_doc_ids: [],
@@ -143,23 +164,20 @@ Deno.serve(async (req) => {
               const chunk = decoder.decode(value, { stream: true });
               buffer += chunk;
 
-              // 按行处理 buffer (上游是 NDJSON)
               const lines = buffer.split("\n");
-              // 保留最后一行（可能不完整）
               buffer = lines.pop() || "";
 
               for (const line of lines) {
                 if (!line.trim()) continue;
                 
                 try {
-                  // 解析上游 JSON: {"ind": 1, "obj": {"type": "message_delta", "content": "Hi"}}
+                  // 解析上游 JSON: {"ind": 1, "obj": {"type": "message_delta", "content": "..."}}
                   const json = JSON.parse(line);
                   
                   if (json && json.obj) {
                     const type = json.obj.type;
                     const content = json.obj.content || "";
 
-                    // 只需要处理 content delta
                     if (type === "message_delta" && content) {
                       if (isStream) {
                         const openaiChunk = {
@@ -170,24 +188,15 @@ Deno.serve(async (req) => {
                             choices: [{ index: 0, delta: { content: content }, finish_reason: null }]
                         };
                         controller.enqueue(encoder.encode(`data: ${JSON.stringify(openaiChunk)}\n\n`));
-                      } else {
-                        // 如果不是流式，先不在这里处理，下面有非流式逻辑，
-                        // 但为了统一代码结构，我们可以在这里通过 controller 传递
-                        // 实际部署通常客户端都请求 stream=true。
-                        // 简单起见，本代码强制以 stream 模式返回给客户端，或客户端需自行处理。
-                        // 如果必须支持非 stream，需要在外面包一层 accumulator。
                       }
-                    } else if (type === "stop" || type === "section_end") {
-                        // 结束信号
-                    }
+                    } 
                   }
                 } catch (e) {
-                  // 忽略 JSON 解析错误，继续下一行
+                  // 忽略非 JSON 行
                 }
               }
             }
             
-            // 结束
             if (isStream) {
               controller.enqueue(encoder.encode("data: [DONE]\n\n"));
             }
@@ -212,8 +221,7 @@ Deno.serve(async (req) => {
         });
       } 
       
-      // 如果客户端请求 stream: false (非流式)
-      // 我们需要把 readable 读完拼接成一个 JSON
+      // 如果客户端请求 stream: false (非流式处理)
       else {
         const reader = readable.getReader();
         const decoder = new TextDecoder();
@@ -223,7 +231,7 @@ Deno.serve(async (req) => {
           const { done, value } = await reader.read();
           if (done) break;
           const text = decoder.decode(value);
-          // 这里的 text 是 "data: {...}" 格式，需要提取 content
+          // 解析我们自己构造的 SSE 格式
           const lines = text.split("\n");
           for (const l of lines) {
              if (l.startsWith("data: ") && l !== "data: [DONE]") {
@@ -264,12 +272,8 @@ Deno.serve(async (req) => {
   return new Response("Not Found", { status: 404 });
 });
 
-/**
- * 将 messages 数组拼接为 Prompt
- */
 function convertMessagesToPrompt(messages: any[]): string {
   if (!Array.isArray(messages)) return "";
-  // 简单拼接，可以根据模型偏好调整
   return messages.map((msg) => {
     return `${msg.role}: ${msg.content}`;
   }).join("\n\n");
